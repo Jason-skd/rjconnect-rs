@@ -26,8 +26,8 @@ pub enum AuthState {
     AwaitingRequest,
     /// At least one method response has been emitted.
     Authenticating,
-    /// EAP-Success was received. The machine rejects further EAP input until
-    /// it is explicitly stopped.
+    /// EAP-Success was received. The machine rejects new EAP requests and
+    /// ignores duplicate results until it is explicitly stopped.
     Authenticated,
     /// The session is waiting before a retry.
     Held,
@@ -352,7 +352,7 @@ impl AuthMachine {
     fn handle_eap(&mut self, packet: &IncomingEap) -> Result<Vec<AuthEffect>, AuthError> {
         if matches!(
             self.state,
-            AuthState::Idle | AuthState::Authenticated | AuthState::Held | AuthState::Terminated
+            AuthState::Idle | AuthState::Held | AuthState::Terminated
         ) {
             return Err(AuthError::InvalidEvent {
                 event: "EAP packet",
@@ -361,8 +361,17 @@ impl AuthMachine {
         }
 
         match packet.code {
+            EapCode::Request if self.state == AuthState::Authenticated => {
+                Err(AuthError::InvalidEvent {
+                    event: "EAP request after authentication",
+                    state: self.state,
+                })
+            }
             EapCode::Request => self.handle_request(packet),
             EapCode::Success => {
+                if self.state == AuthState::Authenticated {
+                    return Ok(Vec::new());
+                }
                 self.validate_result_identifier(packet.identifier)?;
                 self.last_identifier = Some(packet.identifier);
                 self.state = AuthState::Authenticated;
@@ -373,6 +382,9 @@ impl AuthMachine {
                 ])
             }
             EapCode::Failure => {
+                if self.state == AuthState::Authenticated {
+                    return Ok(Vec::new());
+                }
                 self.validate_result_identifier(packet.identifier)?;
                 Ok(self.enter_held(FailureReason::Rejected))
             }
@@ -851,9 +863,34 @@ mod tests {
         assert_eq!(
             request(&mut machine, 10, EapMethod::Identity, Vec::new()),
             Err(AuthError::InvalidEvent {
-                event: "EAP packet",
+                event: "EAP request after authentication",
                 state: AuthState::Authenticated,
             })
+        );
+        assert_eq!(machine.state(), AuthState::Authenticated);
+        Ok(())
+    }
+
+    #[test]
+    fn authenticated_state_ignores_duplicate_results() -> Result<(), Box<dyn Error>> {
+        let mut machine = machine()?;
+        machine.handle(AuthEvent::Start)?;
+        request(&mut machine, 9, EapMethod::Identity, Vec::new())?;
+        machine.handle(AuthEvent::Eap(IncomingEap {
+            code: EapCode::Success,
+            identifier: 9,
+            method: None,
+            payload: Vec::new(),
+        }))?;
+
+        assert_eq!(
+            machine.handle(AuthEvent::Eap(IncomingEap {
+                code: EapCode::Success,
+                identifier: 9,
+                method: None,
+                payload: Vec::new(),
+            }))?,
+            []
         );
         assert_eq!(machine.state(), AuthState::Authenticated);
         Ok(())
