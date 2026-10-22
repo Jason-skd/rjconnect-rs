@@ -118,6 +118,10 @@ impl EthernetLink for LinuxEthernet {
 }
 
 impl FrameChannel for LinuxFrameChannel {
+    #[expect(
+        clippy::useless_conversion,
+        reason = "msghdr ancillary-length field width varies by target"
+    )]
     fn receive(&mut self) -> Result<ReceiveOutcome> {
         set_receive_timeout(self.socket.as_raw_fd(), &self.interface, self.read_timeout)?;
         let deadline = Instant::now().checked_add(self.read_timeout).ok_or(
@@ -142,7 +146,12 @@ impl FrameChannel for LinuxFrameChannel {
             message.msg_iov = &raw mut iovec;
             message.msg_iovlen = 1;
             message.msg_control = control.as_mut_ptr().cast();
-            message.msg_controllen = size_of_val(&control);
+            message.msg_controllen = size_of_val(&control).try_into().map_err(|_error| {
+                PlatformError::OperationFailed {
+                    operation: "receive frame",
+                    message: "ancillary buffer length exceeds platform range".to_owned(),
+                }
+            })?;
 
             // SAFETY: all message pointers reference initialized storage for the
             // duration of the call, and the receive buffer is uniquely borrowed.
@@ -311,14 +320,12 @@ fn enumerate_interfaces() -> Result<Vec<InterfaceInfo>> {
             let is_point_to_point = builder.flags & interface_flag(libc::IFF_POINTOPOINT) != 0;
             let is_up = builder.flags & interface_flag(libc::IFF_UP) != 0
                 && builder.flags & interface_flag(libc::IFF_RUNNING) != 0;
-            let is_wireless = interface_is_wireless(&name).ok();
-            let is_physical = interface_is_physical(&name).ok();
             let nature = classify_device_nature(
                 is_loopback,
                 is_point_to_point,
                 builder.hardware_type == libc::ARPHRD_ETHER,
-                is_wireless,
-                is_physical,
+                || interface_is_wireless(&name),
+                || interface_is_physical(&name),
             );
 
             normalize(DeviceSnapshot {
@@ -337,37 +344,79 @@ const fn interface_flag(flag: libc::c_int) -> u32 {
     flag.unsigned_abs()
 }
 
-const fn classify_device_nature(
+fn classify_device_nature<W, P>(
     is_loopback: bool,
     is_point_to_point: bool,
     is_ethernet_hardware: bool,
-    is_wireless: Option<bool>,
-    is_physical: Option<bool>,
-) -> DeviceNature {
+    wireless_probe: W,
+    physical_probe: P,
+) -> DeviceNature
+where
+    W: FnOnce() -> io::Result<bool>,
+    P: FnOnce() -> io::Result<bool>,
+{
     if is_loopback {
         DeviceNature::Loopback
     } else if is_point_to_point {
         DeviceNature::PointToPoint
     } else {
-        match (is_wireless, is_physical) {
-            (Some(true), _) => DeviceNature::Wireless,
-            (Some(false), Some(true)) if is_ethernet_hardware => DeviceNature::PhysicalEthernet,
+        match wireless_probe() {
+            Ok(true) => DeviceNature::Wireless,
+            Ok(false) => match physical_probe() {
+                Ok(true) if is_ethernet_hardware => DeviceNature::PhysicalEthernet,
+                _ => DeviceNature::VirtualOrUnknown,
+            },
             _ => DeviceNature::VirtualOrUnknown,
         }
     }
 }
 
 fn interface_is_wireless(name: &[u8]) -> io::Result<bool> {
+    if interface_name_looks_wireless(name) {
+        return Ok(true);
+    }
     let interface_path = interface_sysfs_path(name);
     Ok(interface_path.join("wireless").try_exists()?
         || interface_path.join("phy80211").try_exists()?)
 }
 
+fn interface_name_looks_wireless(name: &[u8]) -> bool {
+    const GENERIC_PREFIXES: &[&[u8]] = &[b"wlan", b"wlp", b"wlx"];
+    const MEDIATEK_PREFIXES: &[&[u8]] = &[b"ra", b"rai", b"wds", b"wdsi", b"apcli", b"apclii"];
+
+    if GENERIC_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+    {
+        return true;
+    }
+    MEDIATEK_PREFIXES.iter().any(|prefix| {
+        name.strip_prefix(*prefix)
+            .and_then(|suffix| suffix.first())
+            .is_some_and(u8::is_ascii_digit)
+    })
+}
+
 fn interface_is_physical(name: &[u8]) -> io::Result<bool> {
-    let target = fs::read_link(interface_sysfs_path(name))?;
-    Ok(!target
-        .components()
-        .any(|component| component.as_os_str() == "virtual"))
+    let interface_path = interface_sysfs_path(name);
+    let uevent = fs::read_to_string(interface_path.join("uevent"))?;
+    let iflink = read_sysfs_u32(&interface_path.join("iflink"))?;
+    let ifindex = read_sysfs_u32(&interface_path.join("ifindex"))?;
+    Ok(interface_uevent_is_physical(&uevent, iflink, ifindex))
+}
+
+fn interface_uevent_is_physical(uevent: &str, iflink: u32, ifindex: u32) -> bool {
+    let device_type = uevent
+        .lines()
+        .find_map(|line| line.strip_prefix("DEVTYPE="));
+    (device_type.is_none() || device_type == Some("ethernet")) && iflink == ifindex
+}
+
+fn read_sysfs_u32(path: &Path) -> io::Result<u32> {
+    fs::read_to_string(path)?
+        .trim()
+        .parse()
+        .map_err(|_error| io::Error::new(io::ErrorKind::InvalidData, "invalid sysfs integer"))
 }
 
 fn interface_sysfs_path(name: &[u8]) -> std::path::PathBuf {
@@ -507,6 +556,10 @@ fn set_receive_timeout(socket: libc::c_int, interface: &str, timeout: Duration) 
     }
 }
 
+#[expect(
+    clippy::unnecessary_fallible_conversions,
+    reason = "libc time and ancillary-length field widths vary by target"
+)]
 fn timeout_to_timeval(timeout: Duration) -> Result<libc::timeval> {
     if timeout.is_zero() {
         return Err(PlatformError::InvalidReadTimeout {
@@ -526,13 +579,21 @@ fn timeout_to_timeval(timeout: Duration) -> Result<libc::timeval> {
         }
     }
 
-    let seconds =
-        libc::time_t::try_from(seconds).map_err(|_error| PlatformError::InvalidReadTimeout {
+    let seconds = seconds
+        .try_into()
+        .map_err(|_error| PlatformError::InvalidReadTimeout {
             actual: timeout,
             minimum: FrameChannelConfig::MIN_READ_TIMEOUT,
             maximum: FrameChannelConfig::MAX_READ_TIMEOUT,
         })?;
-    let microseconds = libc::suseconds_t::from(microseconds);
+    let microseconds =
+        microseconds
+            .try_into()
+            .map_err(|_error| PlatformError::InvalidReadTimeout {
+                actual: timeout,
+                minimum: FrameChannelConfig::MIN_READ_TIMEOUT,
+                maximum: FrameChannelConfig::MAX_READ_TIMEOUT,
+            })?;
     Ok(libc::timeval {
         tv_sec: seconds,
         tv_usec: microseconds,
@@ -928,18 +989,71 @@ mod tests {
 
     #[test]
     fn classification_failure_degrades_to_virtual_or_unknown() {
+        let probe_error = || {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "classification denied",
+            ))
+        };
+
         assert_eq!(
-            classify_device_nature(false, false, true, None, Some(true)),
+            classify_device_nature(false, false, true, probe_error, || Ok(true)),
             DeviceNature::VirtualOrUnknown
         );
         assert_eq!(
-            classify_device_nature(false, false, true, Some(false), None),
+            classify_device_nature(false, false, true, || Ok(false), probe_error),
             DeviceNature::VirtualOrUnknown
         );
         assert_eq!(
-            classify_device_nature(false, false, true, Some(false), Some(true)),
+            classify_device_nature(false, false, true, || Ok(false), || Ok(true)),
             DeviceNature::PhysicalEthernet
         );
+        assert_eq!(
+            classify_device_nature(false, false, true, || Ok(true), probe_error),
+            DeviceNature::Wireless
+        );
+        assert_eq!(
+            classify_device_nature(true, false, false, probe_error, probe_error),
+            DeviceNature::Loopback
+        );
+    }
+
+    #[test]
+    fn physical_classification_accepts_driver_backed_ethernet_and_rejects_virtual_types() {
+        assert!(interface_uevent_is_physical(
+            "INTERFACE=eth3\nIFINDEX=2\n",
+            2,
+            2
+        ));
+        assert!(!interface_uevent_is_physical(
+            "DEVTYPE=bridge\nINTERFACE=br0\nIFINDEX=13\n",
+            13,
+            13
+        ));
+        assert!(!interface_uevent_is_physical(
+            "INTERFACE=veth0\nIFINDEX=5\n",
+            5,
+            3
+        ));
+    }
+
+    #[test]
+    fn padavan_wireless_names_are_not_physical_ethernet() {
+        for name in [
+            b"rai0".as_slice(),
+            b"rai1",
+            b"ra0",
+            b"wds0",
+            b"wdsi0",
+            b"apcli0",
+            b"apclii0",
+            b"wlan0",
+        ] {
+            assert!(interface_name_looks_wireless(name));
+        }
+        assert!(!interface_name_looks_wireless(b"eth2"));
+        assert!(!interface_name_looks_wireless(b"eth3"));
+        assert!(!interface_name_looks_wireless(b"br0"));
     }
 
     #[test]
