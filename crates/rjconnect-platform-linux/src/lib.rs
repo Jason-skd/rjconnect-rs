@@ -1,4 +1,4 @@
-//! Linux wired Ethernet platform backend.
+//! Linux wired Ethernet platform adapter.
 //!
 //! The native implementation uses `AF_PACKET` for bounded EAPOL capture and
 //! transmission. Portable interface normalization remains testable on every

@@ -1,6 +1,6 @@
 [package]
 name = "rjconnect-platform-linux"
-description = "Linux wired Ethernet platform backend for rjconnect"
+description = "Linux wired Ethernet platform adapter for rjconnect"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

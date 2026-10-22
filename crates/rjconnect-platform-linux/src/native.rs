@@ -1,9 +1,10 @@
 use std::{
     collections::HashMap,
-    ffi::{CStr, CString},
+    ffi::{CStr, CString, OsString},
     fs, io,
     mem::{size_of, zeroed},
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    os::unix::ffi::OsStringExt,
     path::Path,
     ptr,
     time::{Duration, Instant},
@@ -25,7 +26,6 @@ const EAPOL_ETHERTYPE: u32 = 0x888e;
 #[cfg(test)]
 const EAPOL_ETHERTYPE_WIRE: u16 = 0x888e;
 const VLAN_TPID_8021Q: u32 = 0x8100;
-#[cfg(test)]
 const VLAN_TPID_8021Q_WIRE: u16 = 0x8100;
 const VLAN_TPID_8021AD: u32 = 0x88a8;
 #[cfg(test)]
@@ -81,8 +81,9 @@ impl EthernetLink for LinuxEthernet {
             });
         }
 
+        let raw_interface_name = decode_interface_name(interface_name)?;
         let interface_c =
-            CString::new(interface_name).map_err(|_error| PlatformError::InvalidInterfaceId)?;
+            CString::new(raw_interface_name).map_err(|_error| PlatformError::InvalidInterfaceId)?;
         // SAFETY: `interface_c` is a valid NUL-terminated interface name.
         let raw_ifindex = unsafe { libc::if_nametoindex(interface_c.as_ptr()) };
         if raw_ifindex == 0 {
@@ -98,6 +99,7 @@ impl EthernetLink for LinuxEthernet {
 
         let socket = create_packet_socket(interface_name)?;
         bind_packet_socket(socket.as_raw_fd(), interface_name, ifindex)?;
+        enable_packet_auxdata(socket.as_raw_fd(), interface_name)?;
         set_receive_timeout(socket.as_raw_fd(), interface_name, config.read_timeout())?;
         attach_eapol_filter(socket.as_raw_fd(), interface_name, config.snapshot_length())?;
         if config.promiscuous() {
@@ -117,6 +119,7 @@ impl EthernetLink for LinuxEthernet {
 
 impl FrameChannel for LinuxFrameChannel {
     fn receive(&mut self) -> Result<ReceiveOutcome> {
+        set_receive_timeout(self.socket.as_raw_fd(), &self.interface, self.read_timeout)?;
         let deadline = Instant::now().checked_add(self.read_timeout).ok_or(
             PlatformError::InvalidReadTimeout {
                 actual: self.read_timeout,
@@ -132,11 +135,14 @@ impl FrameChannel for LinuxFrameChannel {
                 iov_len: buffer.len(),
             };
             let mut source: libc::sockaddr_ll = unsafe { zeroed() };
+            let mut control = [0 as libc::c_long; 32];
             let mut message: libc::msghdr = unsafe { zeroed() };
             message.msg_name = (&raw mut source).cast();
             message.msg_namelen = socket_address_length::<libc::sockaddr_ll>("receive frame")?;
             message.msg_iov = &raw mut iovec;
             message.msg_iovlen = 1;
+            message.msg_control = control.as_mut_ptr().cast();
+            message.msg_controllen = size_of_val(&control);
 
             // SAFETY: all message pointers reference initialized storage for the
             // duration of the call, and the receive buffer is uniquely borrowed.
@@ -177,6 +183,9 @@ impl FrameChannel for LinuxFrameChannel {
                 });
             }
             buffer.truncate(received_length);
+            if let Some(auxdata) = vlan_metadata(&message) {
+                restore_vlan_tag(&mut buffer, &auxdata, self.snapshot_length)?;
+            }
 
             let is_own_frame = buffer
                 .get(6..12)
@@ -195,14 +204,7 @@ impl FrameChannel for LinuxFrameChannel {
     fn send(&mut self, frame: &[u8]) -> Result<()> {
         validate_outbound_frame_length(frame.len())?;
 
-        let mut address: libc::sockaddr_ll = unsafe { zeroed() };
-        address.sll_family =
-            u16::try_from(libc::AF_PACKET).map_err(|_error| PlatformError::OperationFailed {
-                operation: "send frame",
-                message: "AF_PACKET address family is invalid".to_owned(),
-            })?;
-        address.sll_protocol = libc::htons(ETH_P_ALL);
-        address.sll_ifindex = self.ifindex;
+        let address = packet_address(self.ifindex)?;
         // SAFETY: `frame` and `address` remain valid for the syscall duration.
         let sent = unsafe {
             libc::sendto(
@@ -249,11 +251,8 @@ impl LinuxFrameChannel {
         if now >= deadline {
             return Ok(false);
         }
-        set_receive_timeout(
-            self.socket.as_raw_fd(),
-            &self.interface,
-            deadline.duration_since(now),
-        )?;
+        let remaining = deadline.duration_since(now);
+        set_receive_timeout(self.socket.as_raw_fd(), &self.interface, remaining)?;
         Ok(true)
     }
 }
@@ -276,7 +275,7 @@ fn enumerate_interfaces() -> Result<Vec<InterfaceInfo>> {
         });
     }
     let guard = IfAddrsGuard(head);
-    let mut builders = HashMap::<String, InterfaceBuilder>::new();
+    let mut builders = HashMap::<Vec<u8>, InterfaceBuilder>::new();
     let mut current = guard.0;
 
     while !current.is_null() {
@@ -284,10 +283,9 @@ fn enumerate_interfaces() -> Result<Vec<InterfaceInfo>> {
         // Null name/address pointers are checked before dereference.
         unsafe {
             let entry = &*current;
-            if !entry.ifa_name.is_null()
-                && let Ok(name) = CStr::from_ptr(entry.ifa_name).to_str()
-            {
-                let builder = builders.entry(name.to_owned()).or_default();
+            if !entry.ifa_name.is_null() {
+                let name = CStr::from_ptr(entry.ifa_name).to_bytes();
+                let builder = builders.entry(name.to_vec()).or_default();
                 builder.flags |= entry.ifa_flags;
                 if !entry.ifa_addr.is_null()
                     && i32::from((*entry.ifa_addr).sa_family) == libc::AF_PACKET
@@ -310,30 +308,23 @@ fn enumerate_interfaces() -> Result<Vec<InterfaceInfo>> {
         .map(|(name, builder)| {
             let is_loopback = builder.flags & interface_flag(libc::IFF_LOOPBACK) != 0
                 || builder.hardware_type == libc::ARPHRD_LOOPBACK;
-            let is_wireless = interface_is_wireless(&name);
             let is_point_to_point = builder.flags & interface_flag(libc::IFF_POINTOPOINT) != 0;
-            let is_physical_ethernet = builder.hardware_type == libc::ARPHRD_ETHER
-                && !is_wireless
-                && !is_loopback
-                && !is_point_to_point
-                && interface_is_physical(&name);
             let is_up = builder.flags & interface_flag(libc::IFF_UP) != 0
                 && builder.flags & interface_flag(libc::IFF_RUNNING) != 0;
+            let is_wireless = interface_is_wireless(&name).ok();
+            let is_physical = interface_is_physical(&name).ok();
+            let nature = classify_device_nature(
+                is_loopback,
+                is_point_to_point,
+                builder.hardware_type == libc::ARPHRD_ETHER,
+                is_wireless,
+                is_physical,
+            );
 
             normalize(DeviceSnapshot {
                 mac_address: builder.mac_address,
-                name,
-                nature: if is_loopback {
-                    DeviceNature::Loopback
-                } else if is_wireless {
-                    DeviceNature::Wireless
-                } else if is_point_to_point {
-                    DeviceNature::PointToPoint
-                } else if is_physical_ethernet {
-                    DeviceNature::PhysicalEthernet
-                } else {
-                    DeviceNature::VirtualOrUnknown
-                },
+                name: encode_interface_name(&name),
+                nature,
                 is_up,
             })
         })
@@ -346,18 +337,95 @@ const fn interface_flag(flag: libc::c_int) -> u32 {
     flag.unsigned_abs()
 }
 
-fn interface_is_wireless(name: &str) -> bool {
-    let interface_path = Path::new("/sys/class/net").join(name);
-    interface_path.join("wireless").exists() || interface_path.join("phy80211").exists()
+const fn classify_device_nature(
+    is_loopback: bool,
+    is_point_to_point: bool,
+    is_ethernet_hardware: bool,
+    is_wireless: Option<bool>,
+    is_physical: Option<bool>,
+) -> DeviceNature {
+    if is_loopback {
+        DeviceNature::Loopback
+    } else if is_point_to_point {
+        DeviceNature::PointToPoint
+    } else {
+        match (is_wireless, is_physical) {
+            (Some(true), _) => DeviceNature::Wireless,
+            (Some(false), Some(true)) if is_ethernet_hardware => DeviceNature::PhysicalEthernet,
+            _ => DeviceNature::VirtualOrUnknown,
+        }
+    }
 }
 
-fn interface_is_physical(name: &str) -> bool {
-    let interface_path = Path::new("/sys/class/net").join(name);
-    fs::read_link(interface_path).is_ok_and(|target| {
-        !target
-            .components()
-            .any(|component| component.as_os_str() == "virtual")
-    })
+fn interface_is_wireless(name: &[u8]) -> io::Result<bool> {
+    let interface_path = interface_sysfs_path(name);
+    Ok(interface_path.join("wireless").try_exists()?
+        || interface_path.join("phy80211").try_exists()?)
+}
+
+fn interface_is_physical(name: &[u8]) -> io::Result<bool> {
+    let target = fs::read_link(interface_sysfs_path(name))?;
+    Ok(!target
+        .components()
+        .any(|component| component.as_os_str() == "virtual"))
+}
+
+fn interface_sysfs_path(name: &[u8]) -> std::path::PathBuf {
+    Path::new("/sys/class/net").join(OsString::from_vec(name.to_vec()))
+}
+
+fn encode_interface_name(name: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+    let mut encoded = String::with_capacity(name.len());
+    for &byte in name {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
+    encoded
+}
+
+fn decode_interface_name(name: &str) -> Result<Vec<u8>> {
+    let bytes = name.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        if bytes[cursor] == b'%' {
+            let Some((&high, rest)) = bytes.get(cursor + 1..).and_then(|tail| tail.split_first())
+            else {
+                return Err(PlatformError::InvalidInterfaceId);
+            };
+            let Some((&low, _)) = rest.split_first() else {
+                return Err(PlatformError::InvalidInterfaceId);
+            };
+            let Some(high) = hex_value(high) else {
+                return Err(PlatformError::InvalidInterfaceId);
+            };
+            let Some(low) = hex_value(low) else {
+                return Err(PlatformError::InvalidInterfaceId);
+            };
+            decoded.push((high << 4) | low);
+            cursor += 3;
+        } else {
+            decoded.push(bytes[cursor]);
+            cursor += 1;
+        }
+    }
+    Ok(decoded)
+}
+
+const fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
 }
 
 fn create_packet_socket(interface: &str) -> Result<OwnedFd> {
@@ -382,14 +450,7 @@ fn create_packet_socket(interface: &str) -> Result<OwnedFd> {
 }
 
 fn bind_packet_socket(socket: libc::c_int, interface: &str, ifindex: i32) -> Result<()> {
-    let mut address: libc::sockaddr_ll = unsafe { zeroed() };
-    address.sll_family =
-        u16::try_from(libc::AF_PACKET).map_err(|_error| PlatformError::OperationFailed {
-            operation: "bind AF_PACKET socket",
-            message: "AF_PACKET address family is invalid".to_owned(),
-        })?;
-    address.sll_protocol = libc::htons(ETH_P_ALL);
-    address.sll_ifindex = ifindex;
+    let address = packet_address(ifindex)?;
 
     // SAFETY: `address` is fully initialized for the selected address length.
     let result = unsafe {
@@ -410,19 +471,20 @@ fn bind_packet_socket(socket: libc::c_int, interface: &str, ifindex: i32) -> Res
     }
 }
 
+fn packet_address(ifindex: i32) -> Result<libc::sockaddr_ll> {
+    let mut address: libc::sockaddr_ll = unsafe { zeroed() };
+    address.sll_family =
+        u16::try_from(libc::AF_PACKET).map_err(|_error| PlatformError::OperationFailed {
+            operation: "construct AF_PACKET address",
+            message: "AF_PACKET address family is invalid".to_owned(),
+        })?;
+    address.sll_protocol = libc::htons(ETH_P_ALL);
+    address.sll_ifindex = ifindex;
+    Ok(address)
+}
+
 fn set_receive_timeout(socket: libc::c_int, interface: &str, timeout: Duration) -> Result<()> {
-    let seconds = libc::time_t::try_from(timeout.as_secs()).map_err(|_error| {
-        PlatformError::InvalidReadTimeout {
-            actual: timeout,
-            minimum: FrameChannelConfig::MIN_READ_TIMEOUT,
-            maximum: FrameChannelConfig::MAX_READ_TIMEOUT,
-        }
-    })?;
-    let microseconds = libc::suseconds_t::from(timeout.subsec_micros());
-    let value = libc::timeval {
-        tv_sec: seconds,
-        tv_usec: microseconds,
-    };
+    let value = timeout_to_timeval(timeout)?;
 
     // SAFETY: `value` is a correctly sized timeval for SO_RCVTIMEO.
     let result = unsafe {
@@ -443,6 +505,38 @@ fn set_receive_timeout(socket: libc::c_int, interface: &str, timeout: Duration) 
             &io::Error::last_os_error(),
         ))
     }
+}
+
+fn timeout_to_timeval(timeout: Duration) -> Result<libc::timeval> {
+    if timeout.is_zero() {
+        return Err(PlatformError::InvalidReadTimeout {
+            actual: timeout,
+            minimum: FrameChannelConfig::MIN_READ_TIMEOUT,
+            maximum: FrameChannelConfig::MAX_READ_TIMEOUT,
+        });
+    }
+
+    let mut seconds = timeout.as_secs();
+    let mut microseconds = timeout.subsec_micros();
+    if !timeout.subsec_nanos().is_multiple_of(1_000) {
+        microseconds = microseconds.saturating_add(1);
+        if microseconds == 1_000_000 {
+            seconds = seconds.saturating_add(1);
+            microseconds = 0;
+        }
+    }
+
+    let seconds =
+        libc::time_t::try_from(seconds).map_err(|_error| PlatformError::InvalidReadTimeout {
+            actual: timeout,
+            minimum: FrameChannelConfig::MIN_READ_TIMEOUT,
+            maximum: FrameChannelConfig::MAX_READ_TIMEOUT,
+        })?;
+    let microseconds = libc::suseconds_t::from(microseconds);
+    Ok(libc::timeval {
+        tv_sec: seconds,
+        tv_usec: microseconds,
+    })
 }
 
 fn attach_eapol_filter(socket: libc::c_int, interface: &str, snapshot_length: usize) -> Result<()> {
@@ -482,6 +576,29 @@ fn attach_eapol_filter(socket: libc::c_int, interface: &str, snapshot_length: us
     }
 }
 
+fn enable_packet_auxdata(socket: libc::c_int, interface: &str) -> Result<()> {
+    let enabled: libc::c_int = 1;
+    // SAFETY: `enabled` is a valid int for PACKET_AUXDATA.
+    let result = unsafe {
+        libc::setsockopt(
+            socket,
+            libc::SOL_PACKET,
+            libc::PACKET_AUXDATA,
+            (&raw const enabled).cast(),
+            socket_address_length::<libc::c_int>("enable packet auxiliary data")?,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(map_native_io_error(
+            "enable packet auxiliary data",
+            interface,
+            &io::Error::last_os_error(),
+        ))
+    }
+}
+
 fn enable_promiscuous(socket: libc::c_int, interface: &str, ifindex: i32) -> Result<()> {
     let membership = libc::packet_mreq {
         mr_ifindex: ifindex,
@@ -515,6 +632,63 @@ fn enable_promiscuous(socket: libc::c_int, interface: &str, ifindex: i32) -> Res
             &io::Error::last_os_error(),
         ))
     }
+}
+
+fn vlan_metadata(message: &libc::msghdr) -> Option<libc::tpacket_auxdata> {
+    // SAFETY: ancillary pointers are supplied by recvmsg and bounded by
+    // msg_controllen. The auxiliary payload is read without creating a reference
+    // with stronger alignment requirements than the socket buffer provides.
+    unsafe {
+        let mut header = libc::CMSG_FIRSTHDR(message);
+        while !header.is_null() {
+            if (*header).cmsg_level == libc::SOL_PACKET
+                && (*header).cmsg_type == libc::PACKET_AUXDATA
+            {
+                return Some(ptr::read_unaligned(
+                    libc::CMSG_DATA(header).cast::<libc::tpacket_auxdata>(),
+                ));
+            }
+            header = libc::CMSG_NXTHDR(message, header);
+        }
+        None
+    }
+}
+
+fn restore_vlan_tag(
+    frame: &mut Vec<u8>,
+    auxdata: &libc::tpacket_auxdata,
+    maximum_length: usize,
+) -> Result<()> {
+    if auxdata.tp_status & libc::TP_STATUS_VLAN_VALID == 0 {
+        return Ok(());
+    }
+    let restored_length = frame
+        .len()
+        .checked_add(4)
+        .filter(|length| *length <= maximum_length)
+        .ok_or_else(|| PlatformError::OperationFailed {
+            operation: "restore VLAN tag",
+            message: "received frame exceeds snapshot length after VLAN restoration".to_owned(),
+        })?;
+    if frame.len() < 12 {
+        return Err(PlatformError::OperationFailed {
+            operation: "restore VLAN tag",
+            message: "received frame is too short to contain an Ethernet header".to_owned(),
+        });
+    }
+
+    let tpid = if auxdata.tp_status & libc::TP_STATUS_VLAN_TPID_VALID != 0 {
+        auxdata.tp_vlan_tpid
+    } else {
+        VLAN_TPID_8021Q_WIRE
+    };
+    let mut restored = Vec::with_capacity(restored_length);
+    restored.extend_from_slice(&frame[..12]);
+    restored.extend_from_slice(&tpid.to_be_bytes());
+    restored.extend_from_slice(&auxdata.tp_vlan_tci.to_be_bytes());
+    restored.extend_from_slice(&frame[12..]);
+    *frame = restored;
+    Ok(())
 }
 
 fn socket_address_length<T>(operation: &'static str) -> Result<libc::socklen_t> {
@@ -718,6 +892,7 @@ mod tests {
             })?;
         let socket = create_packet_socket(interface)?;
         bind_packet_socket(socket.as_raw_fd(), interface, ifindex)?;
+        enable_packet_auxdata(socket.as_raw_fd(), interface)?;
         let timeout = Duration::from_millis(100);
         set_receive_timeout(socket.as_raw_fd(), interface, timeout)?;
         attach_eapol_filter(socket.as_raw_fd(), interface, 4096)?;
@@ -736,6 +911,68 @@ mod tests {
 
         channel.send(&frame)?;
         assert_eq!(channel.receive()?, ReceiveOutcome::Timeout);
+        Ok(())
+    }
+
+    #[test]
+    fn timeout_rounding_never_creates_a_zero_timeval() -> Result<()> {
+        let sub_microsecond = timeout_to_timeval(Duration::from_nanos(1))?;
+        assert_eq!(sub_microsecond.tv_sec, 0);
+        assert_eq!(sub_microsecond.tv_usec, 1);
+
+        let exact = timeout_to_timeval(Duration::from_millis(250))?;
+        assert_eq!(exact.tv_sec, 0);
+        assert_eq!(exact.tv_usec, 250_000);
+        Ok(())
+    }
+
+    #[test]
+    fn classification_failure_degrades_to_virtual_or_unknown() {
+        assert_eq!(
+            classify_device_nature(false, false, true, None, Some(true)),
+            DeviceNature::VirtualOrUnknown
+        );
+        assert_eq!(
+            classify_device_nature(false, false, true, Some(false), None),
+            DeviceNature::VirtualOrUnknown
+        );
+        assert_eq!(
+            classify_device_nature(false, false, true, Some(false), Some(true)),
+            DeviceNature::PhysicalEthernet
+        );
+    }
+
+    #[test]
+    fn interface_ids_round_trip_non_utf8_names() -> Result<()> {
+        let raw_name = b"eth\xff";
+        let encoded = encode_interface_name(raw_name);
+
+        assert_eq!(encoded, "eth%FF");
+        assert_eq!(decode_interface_name(&encoded)?, raw_name);
+        assert_eq!(
+            decode_interface_name("eth%"),
+            Err(PlatformError::InvalidInterfaceId)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn vlan_auxdata_restores_the_stripped_tag() -> Result<()> {
+        let mut frame = frame_with_ether_type_at(12, EAPOL_ETHERTYPE_WIRE);
+        let auxdata = libc::tpacket_auxdata {
+            tp_status: libc::TP_STATUS_VLAN_VALID | libc::TP_STATUS_VLAN_TPID_VALID,
+            tp_len: 0,
+            tp_snaplen: 0,
+            tp_mac: 0,
+            tp_net: 0,
+            tp_vlan_tci: 0x2001,
+            tp_vlan_tpid: 0x88a8,
+        };
+
+        restore_vlan_tag(&mut frame, &auxdata, 4096)?;
+
+        assert_eq!(&frame[12..16], &[0x88, 0xa8, 0x20, 0x01]);
+        assert_eq!(&frame[16..18], &EAPOL_ETHERTYPE_WIRE.to_be_bytes());
         Ok(())
     }
 }

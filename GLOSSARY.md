@@ -21,7 +21,7 @@ _Avoid_: 无线认证, Wi-Fi 认证
 _Avoid_: Ethernet interface
 
 **InterfaceId**：
-platform adapter 在一次接口枚举快照中暴露给调用者的不透明网络接口标识。
+platform adapter 在一次接口枚举快照中暴露给调用者的不透明网络接口标识；Linux adapter 对非 UTF-8 接口名使用可逆转义。
 _Avoid_: ifindex, 网卡序号
 
 **Padavan validation environment**：
