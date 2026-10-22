@@ -10,5 +10,8 @@ publish.workspace = true
 rjconnect-eapol = { path = "../rjconnect-eapol" }
 rjconnect-platform-api = { path = "../rjconnect-platform-api" }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+
 [lints]
 workspace = true

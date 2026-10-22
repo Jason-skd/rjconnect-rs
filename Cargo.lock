@@ -226,6 +226,7 @@ dependencies = [
 name = "rjconnect-platform-linux"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "rjconnect-eapol",
  "rjconnect-platform-api",
 ]

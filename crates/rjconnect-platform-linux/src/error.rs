@@ -2,11 +2,7 @@ use std::io;
 
 use rjconnect_platform_api::PlatformError;
 
-pub(crate) fn map_io_error(
-    operation: &'static str,
-    interface: &str,
-    error: &io::Error,
-) -> PlatformError {
+pub fn map_io_error(operation: &'static str, interface: &str, error: &io::Error) -> PlatformError {
     match error.kind() {
         io::ErrorKind::PermissionDenied => PlatformError::PermissionDenied { operation },
         io::ErrorKind::NotFound | io::ErrorKind::NetworkDown => {
